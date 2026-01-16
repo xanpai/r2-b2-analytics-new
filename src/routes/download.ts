@@ -38,7 +38,7 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
 
         // Retry logic with proper variable scope
         let response: Response | null = null
-        const maxRetries = 2
+        const maxRetries = 3  // Increased retries for B2 rate limiting
 
         for (let attempt = 0; attempt <= maxRetries; attempt++) {
             const controller = new AbortController()
@@ -75,21 +75,32 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
 
                 clearTimeout(timeoutId)
 
-                // Track rate limit responses (429)
-                if (response.status === 429) {
+                // B2 S3 API returns 503 for rate limiting (SlowDown)
+                // B2 Native API returns 429 for rate limiting
+                // Both should be treated as rate limits and retried
+                const isRateLimit = response.status === 429 || response.status === 503
+
+                if (isRateLimit) {
                     totalRetries = attempt
-                    // Log rate limit and continue to retry
-                    console.warn(`Rate limited by B2 bucket: ${extractBucketFromUrl(url)}, attempt ${attempt + 1}`)
+                    const bucket = extractBucketFromUrl(url)
+
+                    // Check for Retry-After header (B2 may include this)
+                    const retryAfter = response.headers.get('Retry-After')
+
+                    console.warn(`Rate limited (${response.status}) by B2 bucket: ${bucket}, attempt ${attempt + 1}${retryAfter ? `, Retry-After: ${retryAfter}s` : ''}`)
 
                     if (attempt === maxRetries) {
                         // Track the rate limit in analytics
-                        const metrics = createMetrics(url, 429, startTime, 0, totalRetries, cf as IncomingRequestCfProperties)
+                        const metrics = createMetrics(url, response.status, startTime, 0, totalRetries, cf as IncomingRequestCfProperties, true)
                         writeAnalytics(env.B2_ANALYTICS, metrics)
-                        return new Response('Rate limited', { status: 429 })
+                        return new Response('Rate limited by storage provider', { status: 503 })
                     }
 
-                    // Exponential backoff for rate limits
-                    const delay = Math.pow(2, attempt) * 1000
+                    // Use Retry-After header if present, otherwise exponential backoff
+                    const delay = retryAfter
+                        ? parseInt(retryAfter, 10) * 1000
+                        : Math.pow(2, attempt) * 1000  // 1s, 2s, 4s, 8s
+
                     await new Promise(resolve => setTimeout(resolve, delay))
                     continue
                 }
@@ -113,7 +124,7 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
                     return new Response('Access denied', { status: 403 })
                 }
 
-                // For 500 errors, log details and potentially retry
+                // For other 5xx errors (not 503 rate limit), retry with backoff
                 if (response.status >= 500) {
                     totalRetries = attempt
 

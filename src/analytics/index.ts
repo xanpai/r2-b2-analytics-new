@@ -1,6 +1,11 @@
 /**
  * B2 Analytics Module
  * Tracks requests, errors, latency, and rate limits per B2 bucket
+ *
+ * B2 Rate Limiting Behavior:
+ * - S3-Compatible API returns 503 for rate limiting (SlowDown)
+ * - Native B2 API returns 429 for rate limiting
+ * - Both should be tracked as rate limit events
  */
 
 export interface B2RequestMetrics {
@@ -8,7 +13,7 @@ export interface B2RequestMetrics {
     statusCode: number       // HTTP status code
     latencyMs: number        // Request latency in milliseconds
     bytesTransferred: number // Bytes transferred
-    isRateLimit: boolean     // Whether this was a 429 rate limit
+    isRateLimit: boolean     // Whether this was a rate limit (429 or 503)
     isError: boolean         // Whether this was an error (4xx/5xx)
     country?: string         // Request country (from CF headers)
     colo?: string            // Cloudflare colo
@@ -64,7 +69,10 @@ export function writeAnalytics(
         const dateStr = now.toISOString().split('T')[0]
         const hourStr = now.getUTCHours().toString().padStart(2, '0')
 
-        const statusCategory = metrics.isRateLimit ? '429' :
+        // Status categories:
+        // - "rate_limit" for 429 and 503 (B2 rate limiting)
+        // - "2xx", "3xx", "4xx", "5xx" for other status codes
+        const statusCategory = metrics.isRateLimit ? 'rate_limit' :
             metrics.statusCode < 300 ? '2xx' :
             metrics.statusCode < 400 ? '3xx' :
             metrics.statusCode < 500 ? '4xx' : '5xx'
@@ -74,7 +82,7 @@ export function writeAnalytics(
             indexes: [metrics.bucket],
             // Store other dimensions in blobs for filtering
             blobs: [
-                statusCategory,                          // blob1: status category (2xx, 4xx, 429, 5xx)
+                statusCategory,                          // blob1: status category (2xx, 4xx, rate_limit, 5xx)
                 metrics.statusCode.toString(),           // blob2: exact status code
                 metrics.country || 'unknown',            // blob3: country
                 metrics.colo || 'unknown',               // blob4: colo
@@ -85,7 +93,7 @@ export function writeAnalytics(
                 1,                                       // double1: request count (always 1)
                 metrics.latencyMs,                       // double2: latency in ms
                 metrics.bytesTransferred,                // double3: bytes transferred
-                metrics.isRateLimit ? 1 : 0,             // double4: rate limit count
+                metrics.isRateLimit ? 1 : 0,             // double4: rate limit count (429 or 503)
                 metrics.isError ? 1 : 0,                 // double5: error count
                 metrics.retryCount,                      // double6: retry count
                 metrics.statusCode >= 200 && metrics.statusCode < 300 ? 1 : 0, // double7: success count
@@ -99,6 +107,14 @@ export function writeAnalytics(
 
 /**
  * Create metrics object from request/response data
+ *
+ * @param url - The B2 URL being requested
+ * @param statusCode - HTTP status code from B2
+ * @param startTime - Request start timestamp
+ * @param bytesTransferred - Number of bytes transferred
+ * @param retryCount - Number of retry attempts
+ * @param cf - Cloudflare request properties
+ * @param forceRateLimit - Force rate limit flag (for 503 which is B2's rate limit response)
  */
 export function createMetrics(
     url: URL,
@@ -106,14 +122,18 @@ export function createMetrics(
     startTime: number,
     bytesTransferred: number,
     retryCount: number,
-    cf?: IncomingRequestCfProperties
+    cf?: IncomingRequestCfProperties,
+    forceRateLimit?: boolean
 ): B2RequestMetrics {
+    // B2 S3 API returns 503 for rate limiting, Native API returns 429
+    const isRateLimit = forceRateLimit || statusCode === 429 || statusCode === 503
+
     return {
         bucket: extractBucketFromUrl(url),
         statusCode,
         latencyMs: Date.now() - startTime,
         bytesTransferred,
-        isRateLimit: statusCode === 429,
+        isRateLimit,
         isError: statusCode >= 400,
         country: cf?.country as string | undefined,
         colo: cf?.colo as string | undefined,
