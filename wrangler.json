@@ -7,12 +7,6 @@
     "enabled": true
   },
   "workers_dev": true,
-  "migrations": [
-    {
-      "tag": "v2",
-      "deleted_classes": ["DownloadCoalescer"]
-    }
-  ],
   "analytics_engine_datasets": [
     {
       "binding": "B2_ANALYTICS",
