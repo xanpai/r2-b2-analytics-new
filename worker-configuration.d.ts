@@ -3,4 +3,5 @@
 interface Env {
 	SECRET: string;
 	IV_SECRET: string;
+	B2_ANALYTICS: AnalyticsEngineDataset;
 }

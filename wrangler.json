@@ -12,5 +12,11 @@
       "tag": "v2",
       "deleted_classes": ["DownloadCoalescer"]
     }
+  ],
+  "analytics_engine_datasets": [
+    {
+      "binding": "B2_ANALYTICS",
+      "dataset": "b2_request_metrics"
+    }
   ]
 }

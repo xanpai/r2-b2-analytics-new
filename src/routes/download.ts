@@ -1,5 +1,6 @@
 import { IRequest, status, json } from 'itty-router'
 import { generateSignature, decrypt } from '../utils'
+import { writeAnalytics, createMetrics, extractBucketFromUrl } from '../analytics'
 
 export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: Env) => {
     // // get signature from query and check if it exists
@@ -26,10 +27,14 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
     //     return status(405)
     // }
 
+    const startTime = Date.now()
+    let url: URL | null = null
+    let totalRetries = 0
+
     try {
         // decrypt the URL
         const decodedURL = await decrypt(urlHASH.replace(/-/g, '+').replace(/_/g, '/'), env.SECRET, env.IV_SECRET)
-        const url = new URL(decodedURL)
+        url = new URL(decodedURL)
 
         // Retry logic with proper variable scope
         let response: Response | null = null
@@ -70,31 +75,60 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
 
                 clearTimeout(timeoutId)
 
+                // Track rate limit responses (429)
+                if (response.status === 429) {
+                    totalRetries = attempt
+                    // Log rate limit and continue to retry
+                    console.warn(`Rate limited by B2 bucket: ${extractBucketFromUrl(url)}, attempt ${attempt + 1}`)
+
+                    if (attempt === maxRetries) {
+                        // Track the rate limit in analytics
+                        const metrics = createMetrics(url, 429, startTime, 0, totalRetries, cf as IncomingRequestCfProperties)
+                        writeAnalytics(env.B2_ANALYTICS, metrics)
+                        return new Response('Rate limited', { status: 429 })
+                    }
+
+                    // Exponential backoff for rate limits
+                    const delay = Math.pow(2, attempt) * 1000
+                    await new Promise(resolve => setTimeout(resolve, delay))
+                    continue
+                }
+
                 // Handle successful responses
                 if (response.ok) {
+                    totalRetries = attempt
                     break // Success! Exit retry loop
                 }
 
                 // Handle specific error codes
                 if (response.status === 404) {
+                    const metrics = createMetrics(url, 404, startTime, 0, attempt, cf as IncomingRequestCfProperties)
+                    writeAnalytics(env.B2_ANALYTICS, metrics)
                     return new Response('File not found', { status: 404 })
                 }
 
                 if (response.status === 403) {
+                    const metrics = createMetrics(url, 403, startTime, 0, attempt, cf as IncomingRequestCfProperties)
+                    writeAnalytics(env.B2_ANALYTICS, metrics)
                     return new Response('Access denied', { status: 403 })
                 }
 
                 // For 500 errors, log details and potentially retry
                 if (response.status >= 500) {
+                    totalRetries = attempt
 
                     // Don't retry on last attempt
                     if (attempt === maxRetries) {
+                        const metrics = createMetrics(url, response.status, startTime, 0, totalRetries, cf as IncomingRequestCfProperties)
+                        writeAnalytics(env.B2_ANALYTICS, metrics)
                         return new Response(`Server error: ${response.status}`, { status: 502 })
                     }
 
                     // Continue to retry logic below
                 } else {
                     // Other 4xx errors shouldn't be retried
+                    const metrics = createMetrics(url, response.status, startTime, 0, attempt, cf as IncomingRequestCfProperties)
+                    writeAnalytics(env.B2_ANALYTICS, metrics)
                     return new Response(`Client error: ${response.status}`, { status: response.status })
                 }
 
@@ -105,6 +139,11 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
 
                 // On last attempt, return error
                 if (attempt === maxRetries) {
+                    if (url) {
+                        const statusCode = error?.name === 'AbortError' ? 504 : 502
+                        const metrics = createMetrics(url, statusCode, startTime, 0, attempt, cf as IncomingRequestCfProperties)
+                        writeAnalytics(env.B2_ANALYTICS, metrics)
+                    }
                     if (error?.name === 'AbortError') {
                         return new Response('Request timeout', { status: 504 })
                     }
@@ -123,11 +162,16 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
 
         // Check if we have a successful response
         if (!response || !response.ok) {
+            if (url) {
+                const metrics = createMetrics(url, 502, startTime, 0, totalRetries, cf as IncomingRequestCfProperties)
+                writeAnalytics(env.B2_ANALYTICS, metrics)
+            }
             return new Response('Failed to fetch file after all retries', { status: 502 })
         }
 
         // Process the successful response
         const contentDisposition = response.headers.get('content-disposition')
+        const contentLength = parseInt(response.headers.get('content-length') || '0', 10)
         const headersObject = Object.fromEntries(response.headers.entries())
 
         if (!contentDisposition?.includes('filename')) {
@@ -136,12 +180,20 @@ export const download = async ({ headers, cf, urlHASH, query }: IRequest, env: E
             headersObject['content-disposition'] = `attachment; filename="${sanitizedFilename}"`
         }
 
+        // Track successful request
+        const metrics = createMetrics(url, response.status, startTime, contentLength, totalRetries, cf as IncomingRequestCfProperties)
+        writeAnalytics(env.B2_ANALYTICS, metrics)
+
         return new Response(response.body, {
             status: response.status,
             headers: new Headers(headersObject)
         })
 
     } catch (error) {
+        if (url) {
+            const metrics = createMetrics(url, 503, startTime, 0, totalRetries, cf as IncomingRequestCfProperties)
+            writeAnalytics(env.B2_ANALYTICS, metrics)
+        }
         return new Response('Service unavailable', { status: 503 })
     }
 }
