@@ -3,15 +3,6 @@
  * Tracks requests, errors, latency, and rate limits per B2 bucket
  */
 
-export interface AnalyticsDataPoint {
-    // Indexes (filterable dimensions) - up to 20
-    indexes: string[]
-    // Blobs (string data) - up to 20
-    blobs?: string[]
-    // Doubles (numeric data) - up to 20
-    doubles?: number[]
-}
-
 export interface B2RequestMetrics {
     bucket: string           // B2 bucket/host identifier
     statusCode: number       // HTTP status code
@@ -57,6 +48,8 @@ export function extractBucketFromUrl(url: URL): string {
 
 /**
  * Write analytics data point to Cloudflare Analytics Engine
+ * Note: Analytics Engine only supports 1 index, so we use bucket as the primary index
+ * and store other dimensions in blobs for filtering
  */
 export function writeAnalytics(
     analyticsEngine: AnalyticsEngineDataset | undefined,
@@ -67,14 +60,6 @@ export function writeAnalytics(
     }
 
     try {
-        // Structure:
-        // index1: bucket name (for filtering by bucket)
-        // index2: status code category (2xx, 4xx, 5xx, 429)
-        // index3: country
-        // index4: colo
-        // index5: date (YYYY-MM-DD for daily aggregation)
-        // index6: hour (HH for hourly patterns)
-
         const now = new Date()
         const dateStr = now.toISOString().split('T')[0]
         const hourStr = now.getUTCHours().toString().padStart(2, '0')
@@ -85,18 +70,16 @@ export function writeAnalytics(
             metrics.statusCode < 500 ? '4xx' : '5xx'
 
         analyticsEngine.writeDataPoint({
-            indexes: [
-                metrics.bucket,                          // index1: bucket
-                statusCategory,                          // index2: status category
-                metrics.country || 'unknown',            // index3: country
-                metrics.colo || 'unknown',               // index4: colo
-                dateStr,                                 // index5: date
-                hourStr,                                 // index6: hour
-            ],
+            // Only 1 index supported - use bucket name for grouping
+            indexes: [metrics.bucket],
+            // Store other dimensions in blobs for filtering
             blobs: [
-                metrics.statusCode.toString(),           // blob1: exact status code
-                metrics.isRateLimit ? 'true' : 'false',  // blob2: is rate limit
-                metrics.isError ? 'true' : 'false',      // blob3: is error
+                statusCategory,                          // blob1: status category (2xx, 4xx, 429, 5xx)
+                metrics.statusCode.toString(),           // blob2: exact status code
+                metrics.country || 'unknown',            // blob3: country
+                metrics.colo || 'unknown',               // blob4: colo
+                dateStr,                                 // blob5: date (YYYY-MM-DD)
+                hourStr,                                 // blob6: hour (00-23)
             ],
             doubles: [
                 1,                                       // double1: request count (always 1)
